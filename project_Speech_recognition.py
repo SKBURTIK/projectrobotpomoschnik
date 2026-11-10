@@ -1,6 +1,8 @@
 import time
 import re
 import cv2
+import cv2.aruco as aruco
+import math
 import mediapipe as mp
 import speech_recognition as sr
 import sounddevice as sd
@@ -11,7 +13,11 @@ WAKE_WORD = "робот"
 SAMPLE_RATE = 16000
 DURATION = 5  # Длина аудиозаписи (секунд)
 
-# Порт подключения к Arduino (в Linux на Orange Pi обычно /dev/ttyACM0 или /dev/ttyUSB0)
+# Реальный физический размер стороны напечатанного рисунка-маркера на руке (в метрах)
+# Обязательно измерьте линейкой ваш распечатанный маркер и укажите точно
+MARKER_SIZE = 0.08  
+
+# Порт подключения к Arduino (в Linux на Orange Pi обычно /dev/ttyACM0)
 PORT_NAME = '/dev/ttyACM0' 
 # =====================================================================
 
@@ -19,77 +25,136 @@ PORT_NAME = '/dev/ttyACM0'
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
 
-# Инициализация связи с контроллером движений по USB
+# Настройка словаря Aruco-маркеров (используем стандартный 4x4)
+aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+aruco_params = aruco.DetectorParameters()
+detector = aruco.ArucoDetector(aruco_dict, aruco_params)
+
+# Параметры камеры (калибровка по умолчанию для стандартных USB-камер)
+cam_matrix = cv2.Mat(3, 3, cv2.CV_64F, [[650.0, 0.0, 320.0], [0.0, 650.0, 240.0], [0.0, 0.0, 1.0]])
+dist_coeffs = cv2.Mat(1, 5, cv2.CV_64F, [0.0, 0.0, 0.0, 0.0, 0.0])
+
 try:
     print(f"[ЯДРО] Подключение к аппаратной платформе на {PORT_NAME}...")
     arduino = serial.Serial(port=PORT_NAME, baudrate=115200, timeout=1)
-    time.sleep(2)  # Пауза на перезагрузку Arduino
+    time.sleep(2)
     print("[ЯДРО] Связь с Arduino успешно установлена!\n")
 except Exception as e:
-    print(f"[ЯДРО] ❌ Ошибка подключения по USB: {e}")
-    print("[ЯДРО] ВНИМАНИЕ: Скрипт запущен в режиме СИМУЛЯЦИИ (без отправки команд)!")
+    print(f"[ЯДРО] Ошибка подключения по USB: {e}. Режим симуляции.")
     arduino = None
 
-def start_camera_hand_tracking(serial_connection):
-    """Функция активируется, когда робот приехал к ногам человека. 
-    Включает зрение камеры и выравнивает манипулятор по ладони."""
-    print("[КАМЕРА] Активация видеопотока с манипулятора...")
-    cap = cv2.VideoCapture(0)  # 0 - ID USB-камеры на конце роборуки
+def start_visual_navigation_and_delivery(serial_connection, cell):
+    """Функция активирует камеру, находит рисунок-маркер на руке, строит 
+    вектор движения, доводит робота до человека и подает предмет по ладони."""
+    print("[КАМЕРА] Включение видеосистемы навигации...")
+    cap = cv2.VideoCapture(0) # Основная USB-камера робота
     
     cam_width = 640
     cap.set(3, cam_width)
-    frame_center_x = cam_width // 2  # Центральный пиксель кадра (320)
+    frame_center_x = cam_width // 2
 
-    print("[КАМЕРА] ИИ ищет ладонь человека для точного сброса...")
+    # Шаг 1: Извлечение из ячейки (шлем команду в Arduino)
+    if serial_connection and serial_connection.is_open:
+        serial_connection.write(f"CELL:{cell}\n".encode('utf-8'))
+    print(f"[НАВИГАЦИЯ] Жду извлечения предмета из ячейки {cell}...")
+    time.sleep(2.0) 
+
+    print("[НАВИГАЦИЯ] Начинаю поиск рисунка-маркера на руке человека...")
     
+    navigating = True
+    while navigating:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, rejected = detector.detectMarkers(gray)
+
+        # УЛЬТРАЗВУКОВОЙ ТОРМОЗ (Опрос Arduino, не уперся ли бампер)
+        if serial_connection and serial_connection.in_waiting > 0:
+            response = serial_connection.readline().decode('utf-8').strip()
+            if "BUMPER_STOP" in response:
+                print("[НАВИГАЦИЯ] Бампер обнаружил человека в упор. Остановка шасси.")
+                if serial_connection and serial_connection.is_open:
+                    serial_connection.write(b"DRIVE:0:0\n") # Стоп моторы
+                navigating = False
+                break
+
+        if ids is not None:
+            # Вычисляем точное пространственное положение рисунка-маркера (3D-вектор)
+            rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(corners, MARKER_SIZE, cam_matrix, dist_coeffs)
+            
+            # tvecs содержит координаты [X, Y, Z] относительно центра объектива в метрах
+            x_m = tvecs[0][0][0] # Смещение влево/вправо
+            z_m = tvecs[0][0][2] # Расстояние до маркера прямо по курсу
+            
+            # Вычисляем угол вектора на человека в радианах
+            angle_rad = math.atan2(x_m, z_m)
+            
+            print(f"[ИИ ВЕКТОР] Дистанция: {z_m:.2f}м, Угол отклонения: {math.degrees(angle_rad):.1f} градусов")
+
+            # Расчет скоростей движения
+            max_speed = 120
+            min_speed = 40
+            
+            # Плавное замедление при приближении ближе 1.5 метров
+            if z_m < 1.5:
+                move_speed = min_speed + (max_speed - min_speed) * (z_m / 1.5)
+                move_speed = max(min_speed, min(max_speed, move_speed))
+            else:
+                move_speed = max_speed
+
+            # Разложение вектора скорости на компоненты колес Илона
+            forward = int(move_speed * math.cos(angle_rad))
+            strafe = int(move_speed * math.sin(angle_rad))
+
+            # Отправляем векторные скорости прямо в моторы Arduino
+            if serial_connection and serial_connection.is_open:
+                motor_cmd = f"DRIVE:{forward}:{strafe}\n"
+                serial_connection.write(motor_cmd.encode('utf-8'))
+        else:
+            # Если рисунок потерялся из виду — плавно тормозим
+            if serial_connection and serial_connection.is_open:
+                serial_connection.write(b"DRIVE:0:0\n")
+
+        time.sleep(0.05) # Обновление вектора 20 раз в секунду
+
+    # Шаг 3: Робот у ног человека. Переключаемся на ИИ-трекинг ладони через MediaPipe
+    print("[КАМЕРА] Переключение в режим ювелирной подачи по ладони...")
     tracking_active = True
     while tracking_active:
         ret, frame = cap.read()
         if not ret:
             continue
 
-        # Переводим кадр в RGB формат для нейросети MediaPipe
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(rgb_frame)
 
         if results.multi_hand_landmarks:
             for hand_landmarks in results.multi_hand_landmarks:
-                # Извлекаем координаты точки №9 (анатомический центр ладони)
-                palm_mcp = hand_landmarks.landmark[9]
-                
-                # Переводим нормализованную ИИ-координату (0.0 - 1.0) в пиксели кадра
-                palm_x = int(palm_mcp.x * cam_width)
-                
-                # Вычисляем ошибку смещения ладони от центра объектива
+                palm_x = int(hand_landmarks.landmark[9].x * cam_width)
                 error_x = palm_x - frame_center_x
                 
-                # Если рука человека не по центру, шлем команды микро-корректировки в Arduino
                 if abs(error_x) > 20: 
                     if serial_connection and serial_connection.is_open:
-                        if error_x > 0:
-                            serial_connection.write(b"ARM:RIGHT\n")
-                        else:
-                            serial_connection.write(b"ARM:LEFT\n")
+                        if error_x > 0: serial_connection.write(b"ARM:RIGHT\n")
+                        else: serial_connection.write(b"ARM:LEFT\n")
                 else:
-                    # Ладонь человека отцентрирована! Вытягиваем манипулятор вперед
-                    print("[КАМЕРА] 🔥 Цель зафиксирована по центру! Выдвигаю руку.")
+                    print("[КАМЕРА] Ладонь отцентрирована. Подаю предмет.")
                     if serial_connection and serial_connection.is_open:
                         serial_connection.write(b"ARM:EXTEND\n")
                     tracking_active = False  
                     break
-                    
-        time.sleep(0.03)  # Частота обработки ~30 кадров/сек
+        time.sleep(0.03)
         
     cap.release()
 
-# Инициализация распознавателя речи
+# Инициализация распознавания речи
 recognizer = sr.Recognizer()
-print("[РЕЧЬ] Мозг робота инициализирован. Ожидание аудиосигнала.")
-print(f"[РЕЧЬ] Четко произнесите фразу, например: '{WAKE_WORD} 5' или '{WAKE_WORD} вези ячейку 12'...")
+print(f"[РЕЧЬ] Система запущена. Жду фразу со словом '{WAKE_WORD}'...")
 
 try:
     while True:
-        # Циклическая запись коротких аудио-отрезков
         audio_data = sd.rec(int(DURATION * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype='int16')
         sd.wait()
         
@@ -97,64 +162,28 @@ try:
         audio_source = sr.AudioData(audio_bytes, SAMPLE_RATE, 2)
         
         try:
-            # Распознавание голоса через облачный API Google
             text = recognizer.recognize_google(audio_source, language="ru-RU").lower().strip()
-            if not text:
-                continue
-                
+            if not text: continue
             print(f"[Слышу]: {text}")
             
             if WAKE_WORD in text:
-                print(f"[ТРИГГЕР]: Обнаружено кодовое имя '{WAKE_WORD}'!")
-                
-                # Поиск чисел в распознанном предложении
                 numbers = re.findall(r'\d+', text)
-                
                 if numbers:
                     cell_number = int(numbers[0])
-                    
-                    # Валидация ячеек (1 - 16)
                     if 1 <= cell_number <= 16:
-                        print(f"[ИИ] Команда одобрена. Целевой объект: Ячейка №{cell_number}.")
+                        # Запуск единого визуального цикла
+                        start_visual_navigation_and_delivery(arduino, cell_number)
                         
-                        if arduino and arduino.is_open:
-                            # Передаем стартовую команду в Arduino
-                            command = f"CELL:{cell_number}\n"
-                            arduino.write(command.encode('utf-8'))
-                            print(f"[USB -> Arduino]: Передана инструкция: {command.strip()}")
-                            
-                            # Переходим в режим ожидания сигналов от аппаратного шасси
-                            print("[ИИ] Робот уехал на склад. Ожидание завершения фазы навигации...")
-                            while True:
-                                if arduino.in_waiting > 0:
-                                    response = arduino.readline().decode('utf-8').strip()
-                                    
-                                    # Робот доехал по UWB к ногам человека
-                                    if "ARRIVED" in response:
-                                        print("[ИИ] Робот запарковался у ног человека. Запуск ИИ-зрения камеры...")
-                                        start_camera_hand_tracking(arduino)
-                                    
-                                    # Весь цикл завершен, человек забрал деталь
-                                    if "DONE" in response:
-                                        print("[ИИ] ✅ Операция выдачи успешно завершена. Робот возвращается в режим ожидания.")
-                                        break
-                                time.sleep(0.1)
-                        else:
-                            print(f"[СИМУЛЯЦИЯ] Робот поехал бы извлекать ячейку {cell_number}...")
-                    else:
-                        print(f"[ОШИБКА] Номер ячейки {cell_number} вне диапазона склада! Допустимо только 1-16.")
-                else:
-                    print("[ПРЕДУПРЕЖДЕНИЕ] Имя робота названо, но номер ячейки не обнаружен.")
-                    
-        except sr.UnknownValueError:
-            pass  # Игнорируем фоновые шумы и тишину в комнате
-        except sr.RequestError as e:
-            print(f"[СЕТЬ] Ошибка связи с сервером. Проверьте интернет/Wi-Fi: {e}")
-            time.sleep(2)
-            
+                        # Ждем маркер финиша от Arduino
+                        while True:
+                            if arduino and arduino.in_waiting > 0:
+                                res = arduino.readline().decode('utf-8').strip()
+                                if "DONE" in res:
+                                    print("[ИИ] Выдача успешно завершена. Робот готов к новым командам.\n")
+                                    break
+                            time.sleep(0.1)
+        except sr.UnknownValueError: pass
+        except sr.RequestError as e: time.sleep(2)
         time.sleep(0.1)
-
 except KeyboardInterrupt:
-    print("\n[ВЫХОД] Программа ядра остановлена пользователем.")
-    if arduino and arduino.is_open:
-        arduino.close()
+    if arduino and arduino.is_open: arduino.close()
